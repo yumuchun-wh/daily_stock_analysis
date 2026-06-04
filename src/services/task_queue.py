@@ -27,6 +27,11 @@ if TYPE_CHECKING:
     from asyncio import Queue as AsyncQueue
 
 from data_provider.base import canonical_stock_code, normalize_stock_code
+from src.services.run_diagnostics import (
+    activate_run_diagnostic_context,
+    get_current_diagnostic_context,
+    reset_run_diagnostic_context,
+)
 from src.utils.analysis_metadata import SELECTION_SOURCES
 
 logger = logging.getLogger(__name__)
@@ -66,23 +71,27 @@ class TaskInfo:
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     report_type: str = "detailed"
+    analysis_phase: str = "auto"
     created_at: datetime = field(default_factory=datetime.now)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     original_query: Optional[str] = None
     selection_source: Optional[str] = None
     skills: Optional[List[str]] = None
+    trace_id: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert task info into an API-friendly dictionary."""
         return {
             "task_id": self.task_id,
+            "trace_id": self.trace_id or self.task_id,
             "stock_code": self.stock_code,
             "stock_name": self.stock_name,
             "status": self.status.value,
             "progress": self.progress,
             "message": self.message,
             "report_type": self.report_type,
+            "analysis_phase": self.analysis_phase,
             "created_at": self.created_at.isoformat(),
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
@@ -104,12 +113,14 @@ class TaskInfo:
             result=self.result,
             error=self.error,
             report_type=self.report_type,
+            analysis_phase=self.analysis_phase,
             created_at=self.created_at,
             started_at=self.started_at,
             completed_at=self.completed_at,
             original_query=self.original_query,
             selection_source=self.selection_source,
             skills=list(self.skills) if self.skills is not None else None,
+            trace_id=self.trace_id or self.task_id,
         )
 
 
@@ -302,6 +313,7 @@ class AnalysisTaskQueue:
         original_query: Optional[str] = None,
         selection_source: Optional[str] = None,
         report_type: str = "detailed",
+        analysis_phase: str = "auto",
         force_refresh: bool = False,
         skills: Optional[List[str]] = None,
     ) -> TaskInfo:
@@ -314,6 +326,7 @@ class AnalysisTaskQueue:
             original_query: Optional raw user input
             selection_source: Optional source label
             report_type: Report type
+            analysis_phase: Requested analysis phase override
             force_refresh: Whether to bypass cache
 
         Returns:
@@ -332,6 +345,7 @@ class AnalysisTaskQueue:
             original_query=original_query,
             selection_source=selection_source,
             report_type=report_type,
+            analysis_phase=analysis_phase,
             force_refresh=force_refresh,
             skills=skills,
         )
@@ -346,6 +360,7 @@ class AnalysisTaskQueue:
         original_query: Optional[str] = None,
         selection_source: Optional[str] = None,
         report_type: str = "detailed",
+        analysis_phase: str = "auto",
         force_refresh: bool = False,
         notify: bool = True,
         skills: Optional[List[str]] = None,
@@ -379,11 +394,13 @@ class AnalysisTaskQueue:
                 task_skills = list(skills) if skills is not None else None
                 task_info = TaskInfo(
                     task_id=task_id,
+                    trace_id=task_id,
                     stock_code=stock_code,
                     stock_name=stock_name,
                     status=TaskStatus.PENDING,
                     message="任务已加入队列",
                     report_type=report_type,
+                    analysis_phase=analysis_phase or "auto",
                     original_query=original_query,
                     selection_source=selection_source,
                     skills=task_skills,
@@ -428,6 +445,7 @@ class AnalysisTaskQueue:
         report_type: str = "detailed",
         message: Optional[str] = "任务已加入队列",
         task_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
     ) -> TaskInfo:
         """
         Submit a generic background callable with task lifecycle tracking.
@@ -438,6 +456,7 @@ class AnalysisTaskQueue:
         task_id = task_id or uuid.uuid4().hex
         task_info = TaskInfo(
             task_id=task_id,
+            trace_id=trace_id or task_id,
             stock_code=stock_code,
             stock_name=stock_name,
             status=TaskStatus.PENDING,
@@ -601,6 +620,8 @@ class AnalysisTaskQueue:
             task = self._tasks.get(task_id)
             if not task:
                 return None
+            trace_id = task.trace_id or task_id
+            analysis_phase = task.analysis_phase
             task.status = TaskStatus.PROCESSING
             task.started_at = datetime.now()
             task.message = "正在分析中..."
@@ -618,15 +639,28 @@ class AnalysisTaskQueue:
             def _on_progress(progress: int, message: str) -> None:
                 self.update_task_progress(task_id, progress, message)
 
+            diag_token = None
+            if get_current_diagnostic_context() is None:
+                diag_token = activate_run_diagnostic_context(
+                    trace_id=trace_id,
+                    task_id=task_id,
+                    query_id=task_id,
+                    stock_code=stock_code,
+                    trigger_source="api",
+                )
             result = service.analyze_stock(
                 stock_code=stock_code,
                 report_type=report_type,
                 force_refresh=force_refresh,
                 query_id=task_id,
+                trace_id=trace_id,
                 send_notification=notify,
                 progress_callback=_on_progress,
                 skills=skills,
+                analysis_phase=analysis_phase,
             )
+            reset_run_diagnostic_context(diag_token)
+            diag_token = None
             
             if result:
                 # 更新任务状态为完成
@@ -657,6 +691,8 @@ class AnalysisTaskQueue:
                 raise Exception(service.last_error or "分析返回空结果")
                 
         except Exception as e:
+            if "diag_token" in locals():
+                reset_run_diagnostic_context(diag_token)
             error_msg = str(e)
             logger.error(f"[TaskQueue] 任务失败: {task_id} ({stock_code}), 错误: {error_msg}")
             
@@ -700,6 +736,7 @@ class AnalysisTaskQueue:
             if not task:
                 return None
 
+            trace_id = task.trace_id or task_id
             task.status = TaskStatus.PROCESSING
             task.started_at = datetime.now()
             task.message = "任务执行中"
@@ -707,7 +744,19 @@ class AnalysisTaskQueue:
             self._broadcast_event("task_started", task.to_dict())
 
         try:
-            result = run_task()
+            diag_token = None
+            if get_current_diagnostic_context() is None:
+                diag_token = activate_run_diagnostic_context(
+                    trace_id=trace_id,
+                    task_id=task_id,
+                    query_id=task_id,
+                    stock_code=task.stock_code,
+                    trigger_source="api",
+                )
+            try:
+                result = run_task()
+            finally:
+                reset_run_diagnostic_context(diag_token)
             if result is None:
                 raise RuntimeError("任务返回空结果，未生成可持久化内容")
 
